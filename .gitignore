@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Local sensitive/runtime data
+access_tokens.txt
+group_comment_pools.json
+token_check_report.txt

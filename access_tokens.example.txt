@@ -1,0 +1,3 @@
+# Один access_token на строку
+# Пример:
+# vk1.a.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
