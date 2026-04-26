@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from app.services.vk_client import VkClient
 
@@ -13,6 +14,7 @@ class ActionResult:
 
     success: bool
     message: str
+    data: dict[str, Any] | None = None
 
 
 class CommentService:
@@ -38,13 +40,21 @@ class CommentService:
 
         error_data = response.get("error")
         if error_data:
-            return ActionResult(success=False, message=self._format_vk_error(error_data))
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data),
+                data=self._extract_error_data(error_data),
+            )
 
         comment_id = response.get("response", {}).get("comment_id")
         if comment_id is None:
             return ActionResult(success=False, message="VK API не вернул comment_id")
 
-        return ActionResult(success=True, message=f"Комментарий отправлен, id={comment_id}")
+        return ActionResult(
+            success=True,
+            message=f"Комментарий отправлен, id={comment_id}",
+            data={"comment_id": comment_id},
+        )
 
     def add_like(self, account_token: str, owner_id: int, post_id: int) -> ActionResult:
         """Ставит лайк на пост."""
@@ -63,13 +73,94 @@ class CommentService:
 
         error_data = response.get("error")
         if error_data:
-            return ActionResult(success=False, message=self._format_vk_error(error_data))
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data),
+                data=self._extract_error_data(error_data),
+            )
 
         likes_count = response.get("response", {}).get("likes")
         if likes_count is None:
             return ActionResult(success=False, message="VK API не вернул число лайков")
 
-        return ActionResult(success=True, message=f"Лайк поставлен, всего лайков: {likes_count}")
+        return ActionResult(
+            success=True,
+            message=f"Лайк поставлен, всего лайков: {likes_count}",
+            data={"likes": likes_count},
+        )
+
+    def add_like_to_comment(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
+        """Ставит лайк на комментарий."""
+        try:
+            response = self.vk_client.call_method(
+                method="likes.add",
+                token=account_token,
+                params={
+                    "type": "comment",
+                    "owner_id": owner_id,
+                    "item_id": comment_id,
+                },
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data),
+                data=self._extract_error_data(error_data),
+            )
+
+        likes_count = response.get("response", {}).get("likes")
+        if likes_count is None:
+            return ActionResult(success=False, message="VK API не вернул число лайков комментария")
+
+        return ActionResult(
+            success=True,
+            message=f"Лайк комментария поставлен, всего лайков: {likes_count}",
+            data={"likes": likes_count},
+        )
+
+    def reply_to_comment(
+        self,
+        account_token: str,
+        owner_id: int,
+        post_id: int,
+        reply_to_comment: int,
+        text: str,
+    ) -> ActionResult:
+        """Отправляет ответ на комментарий под постом."""
+        try:
+            response = self.vk_client.call_method(
+                method="wall.createComment",
+                token=account_token,
+                params={
+                    "owner_id": owner_id,
+                    "post_id": post_id,
+                    "reply_to_comment": reply_to_comment,
+                    "message": text,
+                },
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data),
+                data=self._extract_error_data(error_data),
+            )
+
+        comment_id = response.get("response", {}).get("comment_id")
+        if comment_id is None:
+            return ActionResult(success=False, message="VK API не вернул id ответа")
+        return ActionResult(
+            success=True,
+            message=f"Ответ отправлен, id={comment_id}",
+            data={"comment_id": comment_id},
+        )
 
     def resolve_owner_id(self, account_token: str, group_ref: str) -> tuple[bool, int | None, str]:
         """Преобразует ссылку/ID группы в owner_id для wall/likes."""
@@ -116,6 +207,68 @@ class CommentService:
 
         return True, -object_id, "OK"
 
+    def find_target_post(
+        self,
+        account_token: str,
+        owner_id: int,
+        prefer_pinned: bool = True,
+        limit: int = 10,
+    ) -> ActionResult:
+        """Ищет пост для сценария: закрепленный, иначе последний."""
+        request_limit = max(1, min(limit, 50))
+        try:
+            response = self.vk_client.call_method(
+                method="wall.get",
+                token=account_token,
+                params={
+                    "owner_id": owner_id,
+                    "count": request_limit,
+                },
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data),
+                data=self._extract_error_data(error_data),
+            )
+
+        payload = response.get("response", {})
+        items = payload.get("items", [])
+        if not isinstance(items, list) or not items:
+            return ActionResult(success=False, message="В группе нет доступных постов")
+
+        chosen_post: dict[str, Any] | None = None
+        source = "latest"
+        if prefer_pinned:
+            for item in items:
+                if isinstance(item, dict) and item.get("is_pinned") == 1:
+                    chosen_post = item
+                    source = "pinned"
+                    break
+
+        if chosen_post is None:
+            for item in items:
+                if isinstance(item, dict):
+                    chosen_post = item
+                    break
+
+        if not chosen_post:
+            return ActionResult(success=False, message="VK API не вернул корректные данные постов")
+
+        post_id = chosen_post.get("id")
+        if not isinstance(post_id, int):
+            return ActionResult(success=False, message="VK API не вернул id поста")
+
+        if source == "pinned":
+            message = f"Найден закрепленный пост, id={post_id}"
+        else:
+            message = f"Закрепленный пост не найден, взят последний пост, id={post_id}"
+        return ActionResult(success=True, message=message, data={"post_id": post_id, "source": source})
+
     @staticmethod
     def _format_vk_error(error_data: dict) -> str:
         code = error_data.get("error_code", "n/a")
@@ -124,3 +277,17 @@ class CommentService:
         if isinstance(redirect_uri, str) and redirect_uri.strip():
             return f"VK API {code}: {message}\nОткройте в браузере: {redirect_uri}"
         return f"VK API {code}: {message}"
+
+    @staticmethod
+    def _extract_error_data(error_data: dict) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        code = error_data.get("error_code")
+        message = error_data.get("error_msg")
+        redirect_uri = error_data.get("redirect_uri")
+        if isinstance(code, int):
+            payload["error_code"] = code
+        if isinstance(message, str):
+            payload["error_msg"] = message
+        if isinstance(redirect_uri, str) and redirect_uri.strip():
+            payload["redirect_uri"] = redirect_uri.strip()
+        return payload

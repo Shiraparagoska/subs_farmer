@@ -9,10 +9,12 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class GroupCommentsPool:
-    """Связь между id группы и шаблонами комментариев."""
+    """Связь между id группы и шаблонами комментариев и ответов."""
 
     group_id: str
     comments: list[str] = field(default_factory=list)
+    replies: list[str] = field(default_factory=list)
+    post_strategy: str = "pinned"
 
 
 class PoolsRepository:
@@ -32,8 +34,18 @@ class PoolsRepository:
         for item in raw_items:
             group_id = str(item.get("group_id", "")).strip()
             comments = [str(comment).strip() for comment in item.get("comments", []) if str(comment).strip()]
+            replies = [str(reply).strip() for reply in item.get("replies", []) if str(reply).strip()]
+            raw_strategy = str(item.get("post_strategy", "pinned")).strip().lower()
+            post_strategy = raw_strategy if raw_strategy in {"pinned", "latest"} else "pinned"
             if group_id:
-                result.append(GroupCommentsPool(group_id=group_id, comments=comments))
+                result.append(
+                    GroupCommentsPool(
+                        group_id=group_id,
+                        comments=comments,
+                        replies=replies,
+                        post_strategy=post_strategy,
+                    )
+                )
 
         return result
 
@@ -43,6 +55,8 @@ class PoolsRepository:
                 {
                     "group_id": pool.group_id,
                     "comments": pool.comments,
+                    "replies": pool.replies,
+                    "post_strategy": pool.post_strategy,
                 }
                 for pool in pools
             ]

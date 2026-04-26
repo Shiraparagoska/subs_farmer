@@ -17,6 +17,7 @@ class TokenRecord:
     is_valid: bool = False
     last_error: str | None = None
     owner_name: str | None = None
+    role: str = "liker"
 
 
 class TokenService:
