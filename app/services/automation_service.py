@@ -1,4 +1,4 @@
-"""Сервис автоматического сценария комментария, лайка и ответа."""
+"""Сервис автоматического сценария комментария, ответа и лайка."""
 
 from __future__ import annotations
 
@@ -18,7 +18,9 @@ class ScenarioRunResult:
     requires_confirmation: bool = False
     redirect_uri: str | None = None
     comment_id: int | None = None
+    reply_id: int | None = None
     post_id: int | None = None
+    owner_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -35,11 +37,12 @@ class ScenarioContext:
     delay_seconds: float
     owner_id: int
     comment_id: int | None = None
+    reply_id: int | None = None
     next_step: str = "comment"
 
 
 class AutomationService:
-    """Выполняет последовательность действий комментарий->лайк->ответ."""
+    """Выполняет последовательность действий комментарий->ответ->лайк."""
 
     def __init__(self, comment_service: CommentService | None = None) -> None:
         self.comment_service = comment_service or CommentService()
@@ -55,7 +58,7 @@ class AutomationService:
         comment_text: str,
         reply_text: str,
         prefer_pinned: bool = True,
-        delay_seconds: float = 1.5,
+        delay_seconds: float = 3,
     ) -> ScenarioRunResult:
         normalized_delay = max(0.0, float(delay_seconds))
 
@@ -146,7 +149,9 @@ class AutomationService:
                         requires_confirmation=True,
                         redirect_uri=self._extract_redirect_uri(comment_result),
                         comment_id=context.comment_id,
+                        reply_id=context.reply_id,
                         post_id=context.post_id,
+                        owner_id=context.owner_id,
                     )
                 self._pending_context = None
                 return ScenarioRunResult(success=False, message="Сценарий остановлен на комментарии", logs=logs)
@@ -156,6 +161,40 @@ class AutomationService:
                 logs.append("Не удалось получить ID комментария из результата")
                 self._pending_context = None
                 return ScenarioRunResult(success=False, message="Нет comment_id для следующих шагов", logs=logs)
+            context.next_step = "reply"
+            if context.delay_seconds > 0:
+                time.sleep(context.delay_seconds)
+
+        if context.next_step == "reply":
+            if context.comment_id is None:
+                self._pending_context = None
+                return ScenarioRunResult(success=False, message="Нет comment_id для ответа", logs=logs)
+            reply_result = self.comment_service.reply_to_comment(
+                account_token=context.replier_token,
+                owner_id=context.owner_id,
+                post_id=context.post_id,
+                reply_to_comment=context.comment_id,
+                text=context.reply_text,
+            )
+            logs.append(reply_result.message)
+            if reply_result.success and reply_result.data and isinstance(reply_result.data.get("comment_id"), int):
+                context.reply_id = int(reply_result.data["comment_id"])
+            if not reply_result.success:
+                if self._is_validation_required(reply_result):
+                    self._pending_context = context
+                    return ScenarioRunResult(
+                        success=False,
+                        message="Требуется подтверждение ответчика",
+                        logs=logs,
+                        requires_confirmation=True,
+                        redirect_uri=self._extract_redirect_uri(reply_result),
+                        comment_id=context.comment_id,
+                        reply_id=context.reply_id,
+                        post_id=context.post_id,
+                        owner_id=context.owner_id,
+                    )
+                self._pending_context = None
+                return ScenarioRunResult(success=False, message="Сценарий остановлен на ответе", logs=logs)
             context.next_step = "like"
             if context.delay_seconds > 0:
                 time.sleep(context.delay_seconds)
@@ -180,40 +219,21 @@ class AutomationService:
                         requires_confirmation=True,
                         redirect_uri=self._extract_redirect_uri(like_result),
                         comment_id=context.comment_id,
+                        reply_id=context.reply_id,
                         post_id=context.post_id,
+                        owner_id=context.owner_id,
                     )
                 self._pending_context = None
-                return ScenarioRunResult(success=False, message="Сценарий остановлен на лайке", logs=logs)
-            context.next_step = "reply"
-            if context.delay_seconds > 0:
-                time.sleep(context.delay_seconds)
-
-        if context.next_step == "reply":
-            if context.comment_id is None:
-                self._pending_context = None
-                return ScenarioRunResult(success=False, message="Нет comment_id для ответа", logs=logs)
-            reply_result = self.comment_service.reply_to_comment(
-                account_token=context.replier_token,
-                owner_id=context.owner_id,
-                post_id=context.post_id,
-                reply_to_comment=context.comment_id,
-                text=context.reply_text,
-            )
-            logs.append(reply_result.message)
-            if not reply_result.success:
-                if self._is_validation_required(reply_result):
-                    self._pending_context = context
-                    return ScenarioRunResult(
-                        success=False,
-                        message="Требуется подтверждение ответчика",
-                        logs=logs,
-                        requires_confirmation=True,
-                        redirect_uri=self._extract_redirect_uri(reply_result),
-                        comment_id=context.comment_id,
-                        post_id=context.post_id,
-                    )
-                self._pending_context = None
-                return ScenarioRunResult(success=False, message="Сценарий остановлен на ответе", logs=logs)
+                logs.append("Лайк не поставлен, но комментарий и ответ уже отправлены")
+                return ScenarioRunResult(
+                    success=False,
+                    message="Сценарий остановлен на лайке",
+                    logs=logs,
+                    comment_id=context.comment_id,
+                    reply_id=context.reply_id,
+                    post_id=context.post_id,
+                    owner_id=context.owner_id,
+                )
 
         logs.append("Сценарий завершен успешно")
         self._pending_context = None
@@ -222,7 +242,9 @@ class AutomationService:
             message="Сценарий выполнен",
             logs=logs,
             comment_id=context.comment_id,
+            reply_id=context.reply_id,
             post_id=context.post_id,
+            owner_id=context.owner_id,
         )
 
     def _resolve_owner_id(self, token: str, group_ref: str) -> ActionResult:

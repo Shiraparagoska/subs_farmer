@@ -18,6 +18,9 @@ class TokenRecord:
     last_error: str | None = None
     owner_name: str | None = None
     role: str = "liker"
+    allowed_groups: list[str] | None = None
+    likes_available: bool | None = None
+    last_like_error: str | None = None
 
 
 class TokenService:
@@ -52,7 +55,7 @@ class TokenService:
         if "error" in response:
             error_data = response["error"]
             record.is_valid = False
-            record.last_error = self._format_vk_error(error_data)
+            record.last_error = self._format_vk_error(error_data, method="users.get")
             record.owner_name = None
             return record
 
@@ -92,10 +95,11 @@ class TokenService:
         return token
 
     @staticmethod
-    def _format_vk_error(error_data: dict) -> str:
+    def _format_vk_error(error_data: dict, method: str | None = None) -> str:
         code = error_data.get("error_code", "n/a")
         message = error_data.get("error_msg", "Неизвестная ошибка VK API")
         redirect_uri = error_data.get("redirect_uri")
+        method_prefix = f"{method}: " if method else ""
         if isinstance(redirect_uri, str) and redirect_uri.strip():
-            return f"VK API {code}: {message}\nОткройте в браузере: {redirect_uri}"
-        return f"VK API {code}: {message}"
+            return f"{method_prefix}VK API {code}: {message}\nОткройте в браузере: {redirect_uri}"
+        return f"{method_prefix}VK API {code}: {message}"

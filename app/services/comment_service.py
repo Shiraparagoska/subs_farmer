@@ -34,6 +34,7 @@ class CommentService:
                     "post_id": post_id,
                     "message": text,
                 },
+                request_method="POST",
             )
         except RuntimeError as error:
             return ActionResult(success=False, message=str(error))
@@ -42,7 +43,7 @@ class CommentService:
         if error_data:
             return ActionResult(
                 success=False,
-                message=self._format_vk_error(error_data),
+                message=self._format_vk_error(error_data, method="wall.createComment"),
                 data=self._extract_error_data(error_data),
             )
 
@@ -67,6 +68,7 @@ class CommentService:
                     "owner_id": owner_id,
                     "item_id": post_id,
                 },
+                request_method="POST",
             )
         except RuntimeError as error:
             return ActionResult(success=False, message=str(error))
@@ -75,7 +77,7 @@ class CommentService:
         if error_data:
             return ActionResult(
                 success=False,
-                message=self._format_vk_error(error_data),
+                message=self._format_vk_error(error_data, method="likes.add"),
                 data=self._extract_error_data(error_data),
             )
 
@@ -100,6 +102,7 @@ class CommentService:
                     "owner_id": owner_id,
                     "item_id": comment_id,
                 },
+                request_method="POST",
             )
         except RuntimeError as error:
             return ActionResult(success=False, message=str(error))
@@ -108,7 +111,7 @@ class CommentService:
         if error_data:
             return ActionResult(
                 success=False,
-                message=self._format_vk_error(error_data),
+                message=self._format_vk_error(error_data, method="likes.add"),
                 data=self._extract_error_data(error_data),
             )
 
@@ -141,6 +144,7 @@ class CommentService:
                     "reply_to_comment": reply_to_comment,
                     "message": text,
                 },
+                request_method="POST",
             )
         except RuntimeError as error:
             return ActionResult(success=False, message=str(error))
@@ -149,7 +153,7 @@ class CommentService:
         if error_data:
             return ActionResult(
                 success=False,
-                message=self._format_vk_error(error_data),
+                message=self._format_vk_error(error_data, method="wall.createComment"),
                 data=self._extract_error_data(error_data),
             )
 
@@ -161,6 +165,34 @@ class CommentService:
             message=f"Ответ отправлен, id={comment_id}",
             data={"comment_id": comment_id},
         )
+
+    def delete_comment(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
+        """Удаляет комментарий/ответ со стены, если у аккаунта есть права."""
+        try:
+            response = self.vk_client.call_method(
+                method="wall.deleteComment",
+                token=account_token,
+                params={
+                    "owner_id": owner_id,
+                    "comment_id": comment_id,
+                },
+                request_method="POST",
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data, method="wall.deleteComment"),
+                data=self._extract_error_data(error_data),
+            )
+
+        deleted = response.get("response") == 1
+        if not deleted:
+            return ActionResult(success=False, message=f"VK API не подтвердил удаление comment_id={comment_id}")
+        return ActionResult(success=True, message=f"Старый комментарий удален, id={comment_id}")
 
     def resolve_owner_id(self, account_token: str, group_ref: str) -> tuple[bool, int | None, str]:
         """Преобразует ссылку/ID группы в owner_id для wall/likes."""
@@ -194,7 +226,7 @@ class CommentService:
 
         error_data = response.get("error")
         if error_data:
-            return False, None, self._format_vk_error(error_data)
+            return False, None, self._format_vk_error(error_data, method="utils.resolveScreenName")
 
         resolved = response.get("response")
         if not resolved:
@@ -232,7 +264,7 @@ class CommentService:
         if error_data:
             return ActionResult(
                 success=False,
-                message=self._format_vk_error(error_data),
+                message=self._format_vk_error(error_data, method="wall.get"),
                 data=self._extract_error_data(error_data),
             )
 
@@ -269,14 +301,90 @@ class CommentService:
             message = f"Закрепленный пост не найден, взят последний пост, id={post_id}"
         return ActionResult(success=True, message=message, data={"post_id": post_id, "source": source})
 
+    def comment_exists(self, account_token: str, owner_id: int, post_id: int, comment_id: int) -> ActionResult:
+        """Проверяет, существует ли комментарий к посту."""
+        return self._comment_exists(
+            account_token=account_token,
+            owner_id=owner_id,
+            target_comment_id=comment_id,
+            params={
+                "owner_id": owner_id,
+                "post_id": post_id,
+                "start_comment_id": comment_id,
+                "count": 10,
+                "sort": "asc",
+            },
+            label=f"Комментарий id={comment_id}",
+        )
+
+    def reply_exists(self, account_token: str, owner_id: int, parent_comment_id: int, reply_id: int) -> ActionResult:
+        """Проверяет, существует ли ответ на комментарий."""
+        return self._comment_exists(
+            account_token=account_token,
+            owner_id=owner_id,
+            target_comment_id=reply_id,
+            params={
+                "owner_id": owner_id,
+                "comment_id": parent_comment_id,
+                "start_comment_id": reply_id,
+                "count": 10,
+                "sort": "asc",
+            },
+            label=f"Ответ id={reply_id}",
+        )
+
+    def _comment_exists(
+        self,
+        account_token: str,
+        owner_id: int,
+        target_comment_id: int,
+        params: dict[str, Any],
+        label: str,
+    ) -> ActionResult:
+        try:
+            response = self.vk_client.call_method(
+                method="wall.getComments",
+                token=account_token,
+                params=params,
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data, method="wall.getComments"),
+                data=self._extract_error_data(error_data),
+            )
+
+        items = response.get("response", {}).get("items", [])
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != target_comment_id:
+                continue
+            if self._is_deleted_comment(item):
+                return ActionResult(success=True, message=f"{label} удален", data={"exists": False})
+            return ActionResult(success=True, message=f"{label} найден", data={"exists": True})
+        return ActionResult(success=True, message=f"{label} не найден", data={"exists": False})
+
     @staticmethod
-    def _format_vk_error(error_data: dict) -> str:
+    def _is_deleted_comment(item: dict[str, Any]) -> bool:
+        deleted_value = item.get("deleted")
+        if deleted_value in (1, True, "1", "true", "True"):
+            return True
+        if item.get("text") == "" and item.get("from_id") is None:
+            return True
+        return False
+
+    @staticmethod
+    def _format_vk_error(error_data: dict, method: str | None = None) -> str:
         code = error_data.get("error_code", "n/a")
         message = error_data.get("error_msg", "Неизвестная ошибка VK API")
         redirect_uri = error_data.get("redirect_uri")
+        method_prefix = f"{method}: " if method else ""
         if isinstance(redirect_uri, str) and redirect_uri.strip():
-            return f"VK API {code}: {message}\nОткройте в браузере: {redirect_uri}"
-        return f"VK API {code}: {message}"
+            return f"{method_prefix}VK API {code}: {message}\nОткройте в браузере: {redirect_uri}"
+        return f"{method_prefix}VK API {code}: {message}"
 
     @staticmethod
     def _extract_error_data(error_data: dict) -> dict[str, Any]:

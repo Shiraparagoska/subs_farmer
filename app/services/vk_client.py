@@ -14,7 +14,7 @@ from typing import Any
 class VkApiConfig:
     """Параметры выполнения запросов к VK API."""
 
-    version: str = "5.199"
+    version: str = "5.131"
     timeout_seconds: float = 15.0
 
 
@@ -24,14 +24,29 @@ class VkClient:
     def __init__(self, config: VkApiConfig | None = None) -> None:
         self.config = config or VkApiConfig()
 
-    def call_method(self, method: str, token: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call_method(
+        self,
+        method: str,
+        token: str,
+        params: dict[str, Any] | None = None,
+        request_method: str = "GET",
+    ) -> dict[str, Any]:
         """Вызывает метод VK API и возвращает сырой JSON-ответ."""
         request_params: dict[str, Any] = dict(params or {})
         request_params["access_token"] = token
         request_params["v"] = self.config.version
         query = urlencode(request_params)
-        url = f"https://api.vk.com/method/{method}?{query}"
-        request = Request(url, method="GET")
+        url = f"https://api.vk.com/method/{method}"
+        normalized_request_method = request_method.upper()
+        if normalized_request_method == "POST":
+            request = Request(
+                url,
+                data=query.encode("utf-8"),
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        else:
+            request = Request(f"{url}?{query}", method="GET")
 
         try:
             with urlopen(request, timeout=self.config.timeout_seconds) as response:

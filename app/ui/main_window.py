@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import random
+from datetime import datetime
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
@@ -13,6 +17,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QDialog,
+    QDialogButtonBox,
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
@@ -27,6 +33,8 @@ from PySide6.QtWidgets import (
 
 from app.services.automation_service import AutomationService, ScenarioRunResult
 from app.services.comment_service import CommentService
+from app.services.monitoring_service import MonitoredTask, MonitoringService
+from app.runtime_paths import application_directory
 from app.services.token_service import TokenRecord, TokenService
 from app.storage.repositories import GroupCommentsPool, PoolsRepository
 
@@ -51,10 +59,21 @@ class MainWindow(QMainWindow):
         self.token_service = TokenService()
         self.comment_service = CommentService()
         self.automation_service = AutomationService(self.comment_service)
-        self.pools_repository = PoolsRepository()
+        self.monitoring_service = MonitoringService(self.comment_service)
+        self._app_dir = application_directory()
+        self.pools_repository = PoolsRepository(storage_path=self._app_dir / "group_comment_pools.json")
         self.token_records: list[TokenRecord] = []
         self.group_pools: list[GroupCommentsPool] = []
-        self.tokens_file_path = Path.cwd() / "access_tokens.txt"
+        self.last_comment_ids_by_group: dict[str, int] = {}
+        self.last_log_minute: str | None = None
+        self.monitoring_timer = QTimer(self)
+        self.monitoring_timer.setInterval(30_000)
+        self.monitoring_timer.timeout.connect(self._run_monitoring_tick)
+        self.monitoring_countdown_seconds = 30
+        self.monitoring_countdown_timer = QTimer(self)
+        self.monitoring_countdown_timer.setInterval(1_000)
+        self.monitoring_countdown_timer.timeout.connect(self._update_monitoring_countdown)
+        self.tokens_file_path = self._app_dir / "access_tokens.txt"
         self.setWindowTitle("VK Помощник")
         self.resize(1100, 760)
         self._setup_layout()
@@ -64,7 +83,6 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self._build_accounts_tab(), "Аккаунты")
         tabs.addTab(self._build_pools_tab(), "Пулы")
-        tabs.addTab(self._create_placeholder("Лента мониторинга комментариев"), "Мониторинг")
         tabs.addTab(self._build_actions_tab(), "Действия")
         tabs.addTab(self._create_placeholder("Журнал операций и диагностика API"), "Диагностика")
 
@@ -93,6 +111,10 @@ class MainWindow(QMainWindow):
         check_button.clicked.connect(self._check_tokens)
         button_row.addWidget(check_button)
 
+        check_likes_button = QPushButton("Проверить лайки")
+        check_likes_button.clicked.connect(self._check_likes)
+        button_row.addWidget(check_likes_button)
+
         delete_button = QPushButton("Удалить токен")
         delete_button.clicked.connect(self._delete_selected_token)
         button_row.addWidget(delete_button)
@@ -104,8 +126,8 @@ class MainWindow(QMainWindow):
 
         self.tokens_file_label = QLabel("")
         self.tokens_table = QTableWidget()
-        self.tokens_table.setColumnCount(4)
-        self.tokens_table.setHorizontalHeaderLabels(["Токен", "Роль", "Статус", "Комментарий"])
+        self.tokens_table.setColumnCount(5)
+        self.tokens_table.setHorizontalHeaderLabels(["Токен", "Роль", "Группы", "Статус", "Комментарий"])
         self.tokens_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.tokens_table.verticalHeader().setVisible(False)
         self.tokens_table.horizontalHeader().setStretchLastSection(True)
@@ -119,7 +141,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите файл с токенами",
-            str(Path.cwd()),
+            str(self._app_dir),
             "Текстовые файлы (*.txt);;Все файлы (*.*)",
         )
         if not file_path:
@@ -141,6 +163,69 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Проверка завершена: валидных {valid_count} из {len(self.token_records)}"
         )
+
+    def _check_likes(self) -> None:
+        if not self.token_records:
+            self.statusBar().showMessage("Нет токенов для проверки лайков")
+            return
+        if hasattr(self, "pools_table"):
+            self.group_pools = self._collect_pools_from_table()
+        if not self.group_pools:
+            self.statusBar().showMessage("Добавьте хотя бы одну группу в пулы")
+            return
+
+        liker_records = self._find_records_by_role("liker")
+        if not liker_records:
+            self.statusBar().showMessage("Нет аккаунтов с ролью Лайкер")
+            return
+
+        checked_count = 0
+        ok_count = 0
+        self.statusBar().showMessage("Проверяю likes.add у лайкеров...")
+        for record in liker_records:
+            pool = self._pick_like_test_pool(record)
+            if pool is None:
+                record.likes_available = False
+                record.last_like_error = "Нет разрешенной группы для теста лайков"
+                checked_count += 1
+                continue
+
+            ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, pool.group_id)
+            if not ok or owner_id is None:
+                record.likes_available = False
+                record.last_like_error = f"owner_id: {message}"
+                checked_count += 1
+                continue
+
+            post_result = self.comment_service.find_target_post(
+                account_token=record.token,
+                owner_id=owner_id,
+                prefer_pinned=pool.post_strategy != "latest",
+            )
+            if not post_result.success:
+                record.likes_available = False
+                record.last_like_error = post_result.message
+                checked_count += 1
+                continue
+            if not post_result.data or not isinstance(post_result.data.get("post_id"), int):
+                record.likes_available = False
+                record.last_like_error = "Не удалось получить post_id для теста лайка"
+                checked_count += 1
+                continue
+
+            like_result = self.comment_service.add_like(
+                account_token=record.token,
+                owner_id=owner_id,
+                post_id=int(post_result.data["post_id"]),
+            )
+            record.likes_available = like_result.success
+            record.last_like_error = None if like_result.success else like_result.message
+            checked_count += 1
+            if like_result.success:
+                ok_count += 1
+
+        self._fill_tokens_table()
+        self.statusBar().showMessage(f"Проверка лайков завершена: OK {ok_count} из {checked_count}")
 
     def _delete_selected_token(self) -> None:
         current_row = self.tokens_table.currentRow()
@@ -172,9 +257,15 @@ class MainWindow(QMainWindow):
             return
 
         roles_by_token = {record.token: record.role for record in self.token_records}
+        groups_by_token = {record.token: list(record.allowed_groups or []) for record in self.token_records}
+        likes_by_token = {record.token: record.likes_available for record in self.token_records}
+        like_errors_by_token = {record.token: record.last_like_error for record in self.token_records}
         self.token_records = self.token_service.parse_txt(self.tokens_file_path)
         for record in self.token_records:
             record.role = roles_by_token.get(record.token, "liker")
+            record.allowed_groups = groups_by_token.get(record.token, [])
+            record.likes_available = likes_by_token.get(record.token)
+            record.last_like_error = like_errors_by_token.get(record.token)
         self.tokens_file_label.setText(f"Файл токенов: {self.tokens_file_path}")
         self._fill_tokens_table()
         self._refresh_actions_selectors()
@@ -184,6 +275,7 @@ class MainWindow(QMainWindow):
         self.tokens_table.setRowCount(len(self.token_records))
         for row_index, record in enumerate(self.token_records):
             self.tokens_table.setItem(row_index, 0, QTableWidgetItem(self._mask_token(record.token)))
+
             role_combo = QComboBox()
             for role_label, role_value in ROLE_LABEL_TO_VALUE.items():
                 role_combo.addItem(role_label, role_value)
@@ -194,15 +286,30 @@ class MainWindow(QMainWindow):
             )
             self.tokens_table.setCellWidget(row_index, 1, role_combo)
 
+            groups_button = QPushButton(self._format_allowed_groups(record))
+            groups_button.clicked.connect(
+                lambda _checked=False, current_record=record: self._select_token_groups(current_record)
+            )
+            self.tokens_table.setCellWidget(row_index, 2, groups_button)
+
             if record.last_error:
                 status_text = "Ошибка"
             elif record.is_valid:
                 status_text = "Валидный"
             else:
                 status_text = "Не проверен"
-            self.tokens_table.setItem(row_index, 2, QTableWidgetItem(status_text))
-            comment_text = record.last_error or (record.owner_name or "")
-            self.tokens_table.setItem(row_index, 3, QTableWidgetItem(comment_text))
+            self.tokens_table.setItem(row_index, 3, QTableWidgetItem(status_text))
+            comment_parts: list[str] = []
+            if record.last_error:
+                comment_parts.append(record.last_error)
+            elif record.owner_name:
+                comment_parts.append(record.owner_name)
+            if record.likes_available is True:
+                comment_parts.append("Лайки OK")
+            elif record.likes_available is False:
+                comment_parts.append(f"Лайки ошибка: {record.last_like_error or 'неизвестно'}")
+            comment_text = " | ".join(comment_parts)
+            self.tokens_table.setItem(row_index, 4, QTableWidgetItem(comment_text))
 
     def _update_token_role(self, record: TokenRecord, role_combo: QComboBox) -> None:
         role = role_combo.currentData()
@@ -210,6 +317,44 @@ class MainWindow(QMainWindow):
             return
         record.role = role
         self._refresh_actions_selectors()
+
+    def _select_token_groups(self, record: TokenRecord) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Выберите группы для аккаунта")
+        layout = QVBoxLayout(dialog)
+
+        hint = QLabel("Пустой выбор = аккаунт доступен для всех групп")
+        layout.addWidget(hint)
+
+        groups_list = QListWidget()
+        groups_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        selected_groups = set(record.allowed_groups or [])
+        for pool in self.group_pools:
+            item = QListWidgetItem(pool.group_id)
+            item.setSelected(pool.group_id in selected_groups)
+            groups_list.addItem(item)
+        layout.addWidget(groups_list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        record.allowed_groups = [item.text().strip() for item in groups_list.selectedItems() if item.text().strip()]
+        self._fill_tokens_table()
+        self._refresh_actions_selectors()
+
+    @staticmethod
+    def _format_allowed_groups(record: TokenRecord) -> str:
+        groups = record.allowed_groups or []
+        if not groups:
+            return "Все группы"
+        if len(groups) <= 2:
+            return " || ".join(groups)
+        return f"{groups[0]} || {groups[1]} +{len(groups) - 2}"
 
     @staticmethod
     def _mask_token(token: str) -> str:
@@ -269,6 +414,7 @@ class MainWindow(QMainWindow):
         row_index = self.pools_table.rowCount()
         self.pools_table.insertRow(row_index)
         self._set_post_strategy_cell(row_index, "pinned")
+        self._refresh_accounts_group_selectors()
         self.statusBar().showMessage("Строка группы добавлена")
 
     def _delete_pool_row(self) -> None:
@@ -277,6 +423,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Выберите строку для удаления")
             return
         self.pools_table.removeRow(current_row)
+        self.group_pools = self._collect_pools_from_table()
+        self._refresh_accounts_group_selectors()
+        self._refresh_actions_selectors()
         self.statusBar().showMessage("Строка удалена")
 
     def _load_pools_table(self) -> None:
@@ -292,6 +441,7 @@ class MainWindow(QMainWindow):
             self.pools_table.setItem(row_index, 2, QTableWidgetItem(replies_text))
             self._set_post_strategy_cell(row_index, pool.post_strategy)
 
+        self._refresh_accounts_group_selectors()
         self._refresh_actions_selectors()
         self.statusBar().showMessage(f"Загружено пулов: {len(pools)}")
 
@@ -305,6 +455,7 @@ class MainWindow(QMainWindow):
             return
 
         self.group_pools = pools
+        self._refresh_accounts_group_selectors()
         self._refresh_actions_selectors()
         self.statusBar().showMessage(f"Пулы сохранены: {len(pools)}")
 
@@ -318,40 +469,36 @@ class MainWindow(QMainWindow):
         group_label = QLabel("Группы (из пула, можно выбрать несколько):")
         self.actions_group_list = QListWidget()
         self.actions_group_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.actions_group_list.itemSelectionChanged.connect(self._fill_comment_from_selected_group)
+        self.actions_group_list.itemSelectionChanged.connect(self._on_group_selection_changed)
         layout.addWidget(group_label)
         layout.addWidget(self.actions_group_list)
 
-        post_label = QLabel("ID поста:")
+        self.select_all_groups_checkbox = QCheckBox("Выбрать все группы")
+        self.select_all_groups_checkbox.toggled.connect(self._toggle_all_groups_selection)
+        layout.addWidget(self.select_all_groups_checkbox)
+
         self.post_id_input = QLineEdit()
         self.post_id_input.setPlaceholderText("Например: 123")
-        layout.addWidget(post_label)
-        layout.addWidget(self.post_id_input)
+        self.post_id_input.setVisible(False)
 
-        comment_id_label = QLabel("ID комментария (для лайка/ответа):")
         self.comment_id_input = QLineEdit()
         self.comment_id_input.setPlaceholderText("Например: 456")
-        layout.addWidget(comment_id_label)
-        layout.addWidget(self.comment_id_input)
+        self.comment_id_input.setVisible(False)
 
-        comment_label = QLabel("Текст комментария:")
         self.comment_input = QPlainTextEdit()
         self.comment_input.setPlaceholderText("Введите текст комментария")
         self.comment_input.setFixedHeight(90)
-        layout.addWidget(comment_label)
-        layout.addWidget(self.comment_input)
+        self.comment_input.setVisible(False)
 
-        reply_label = QLabel("Текст ответа:")
         self.reply_input = QPlainTextEdit()
         self.reply_input.setPlaceholderText("Введите текст ответа")
         self.reply_input.setFixedHeight(90)
-        layout.addWidget(reply_label)
-        layout.addWidget(self.reply_input)
+        self.reply_input.setVisible(False)
 
         delay_label = QLabel("Пауза между шагами (сек):")
         self.delay_input = QLineEdit()
-        self.delay_input.setPlaceholderText("Например: 1.5")
-        self.delay_input.setText("1.5")
+        self.delay_input.setPlaceholderText("Например: 5")
+        self.delay_input.setText("3")
         layout.addWidget(delay_label)
         layout.addWidget(self.delay_input)
 
@@ -367,22 +514,41 @@ class MainWindow(QMainWindow):
         reply_button = QPushButton("Ответчик: ответить на комментарий")
         reply_button.clicked.connect(self._send_reply_by_replier)
         button_row.addWidget(reply_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
 
-        scenario_button = QPushButton("Авто: комментарий -> лайк -> ответ")
+        auto_row = QHBoxLayout()
+        scenario_button = QPushButton("Авто: комментарий -> ответ -> лайк")
+        scenario_button.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; font-weight: 600; }")
         scenario_button.clicked.connect(self._run_auto_scenario)
-        button_row.addWidget(scenario_button)
+        auto_row.addWidget(scenario_button)
 
         self.continue_scenario_button = QPushButton("Продолжить после подтверждения")
         self.continue_scenario_button.setEnabled(False)
         self.continue_scenario_button.clicked.connect(self._continue_auto_scenario)
-        button_row.addWidget(self.continue_scenario_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
+        auto_row.addWidget(self.continue_scenario_button)
+        auto_row.addStretch(1)
+        layout.addLayout(auto_row)
+
+        monitoring_row = QHBoxLayout()
+        start_monitoring_button = QPushButton("Запустить мониторинг")
+        start_monitoring_button.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; font-weight: 600; }")
+        start_monitoring_button.clicked.connect(self._start_monitoring)
+        monitoring_row.addWidget(start_monitoring_button)
+
+        stop_monitoring_button = QPushButton("Остановить мониторинг")
+        stop_monitoring_button.clicked.connect(self._stop_monitoring)
+        monitoring_row.addWidget(stop_monitoring_button)
+
+        self.monitoring_status_label = QLabel("Мониторинг: выключен")
+        monitoring_row.addWidget(self.monitoring_status_label)
+        monitoring_row.addStretch(1)
+        layout.addLayout(monitoring_row)
 
         result_label = QLabel("Результат:")
         self.actions_result_output = QPlainTextEdit()
         self.actions_result_output.setReadOnly(True)
-        self.actions_result_output.setFixedHeight(90)
+        self.actions_result_output.setFixedHeight(220)
         self.actions_result_output.setPlainText("-")
         layout.addWidget(result_label)
         layout.addWidget(self.actions_result_output)
@@ -406,10 +572,25 @@ class MainWindow(QMainWindow):
         for pool in self.group_pools:
             item = QListWidgetItem(pool.group_id)
             self.actions_group_list.addItem(item)
-            if pool.group_id in selected_before:
+            if self.select_all_groups_checkbox.isChecked() or pool.group_id in selected_before:
                 item.setSelected(True)
 
         self._refresh_roles_info()
+        self._fill_comment_from_selected_group()
+
+    def _toggle_all_groups_selection(self, checked: bool) -> None:
+        if checked:
+            self.actions_group_list.selectAll()
+        else:
+            self.actions_group_list.clearSelection()
+        self._fill_comment_from_selected_group()
+
+    def _on_group_selection_changed(self) -> None:
+        total_groups = self.actions_group_list.count()
+        selected_count = len(self.actions_group_list.selectedItems())
+        self.select_all_groups_checkbox.blockSignals(True)
+        self.select_all_groups_checkbox.setChecked(total_groups > 0 and selected_count == total_groups)
+        self.select_all_groups_checkbox.blockSignals(False)
         self._fill_comment_from_selected_group()
 
     def _refresh_roles_info(self) -> None:
@@ -424,16 +605,64 @@ class MainWindow(QMainWindow):
         )
 
     def _role_account_label(self, role: str) -> str:
-        record = self._find_record_by_role(role)
-        if record is None:
+        records = self._find_records_by_role(role)
+        if not records:
             return "не назначен"
+        if len(records) > 1:
+            return f"{len(records)} аккаунтов"
+        record = records[0]
         token_name = record.owner_name or "Аккаунт без имени"
         return f"{token_name} ({self._mask_token(record.token)})"
 
     def _find_record_by_role(self, role: str) -> TokenRecord | None:
-        for record in self.token_records:
-            if record.role == role:
-                return record
+        records = self._find_records_by_role(role)
+        return records[0] if records else None
+
+    def _find_records_by_role(self, role: str) -> list[TokenRecord]:
+        return [record for record in self.token_records if record.role == role]
+
+    def _find_records_for_group(self, role: str, group_ref: str) -> list[TokenRecord]:
+        normalized_group = self._normalize_group_ref_for_match(group_ref)
+        records: list[TokenRecord] = []
+        for record in self._find_records_by_role(role):
+            allowed_groups = record.allowed_groups or []
+            if not allowed_groups:
+                records.append(record)
+                continue
+            normalized_allowed = {self._normalize_group_ref_for_match(item) for item in allowed_groups}
+            if normalized_group in normalized_allowed:
+                records.append(record)
+        return records
+
+    def _find_records_for_group_filtered(
+        self,
+        role: str,
+        group_ref: str,
+        disabled_accounts: set[tuple[str, str]],
+    ) -> list[TokenRecord]:
+        return [
+            record
+            for record in self._find_records_for_group(role, group_ref)
+            if (role, record.token) not in disabled_accounts
+        ]
+
+    @staticmethod
+    def _normalize_group_ref_for_match(group_ref: str) -> str:
+        value = group_ref.strip().lower()
+        for prefix in ("https://vk.com/", "http://vk.com/", "vk.com/"):
+            if value.startswith(prefix):
+                value = value[len(prefix) :]
+                break
+        return value.strip().rstrip("/").split("?")[0].split("#")[0]
+
+    def _pick_like_test_pool(self, record: TokenRecord) -> GroupCommentsPool | None:
+        allowed_groups = record.allowed_groups or []
+        if not allowed_groups:
+            return self.group_pools[0] if self.group_pools else None
+        normalized_allowed = {self._normalize_group_ref_for_match(item) for item in allowed_groups}
+        for pool in self.group_pools:
+            if self._normalize_group_ref_for_match(pool.group_id) in normalized_allowed:
+                return pool
         return None
 
     def _fill_comment_from_selected_group(self) -> None:
@@ -507,10 +736,32 @@ class MainWindow(QMainWindow):
         strategy_combo.currentIndexChanged.connect(self._refresh_actions_selectors)
         self.pools_table.setCellWidget(row_index, 3, strategy_combo)
 
+    def _refresh_accounts_group_selectors(self) -> None:
+        if not hasattr(self, "tokens_table"):
+            return
+        if hasattr(self, "pools_table"):
+            self.group_pools = self._collect_pools_from_table()
+
+        for row_index, record in enumerate(self.token_records):
+            selector = self.tokens_table.cellWidget(row_index, 2)
+            if isinstance(selector, QPushButton):
+                selector.setText(self._format_allowed_groups(record))
+                continue
+            if not isinstance(selector, QListWidget):
+                continue
+            selected_groups = set(record.allowed_groups or [])
+            selector.blockSignals(True)
+            selector.clear()
+            for pool in self.group_pools:
+                item = QListWidgetItem(pool.group_id)
+                item.setSelected(pool.group_id in selected_groups)
+                selector.addItem(item)
+            selector.blockSignals(False)
+
     def _resolve_base_context(self, require_post_id: bool = True) -> tuple[str | None, int | None]:
         selected_groups = self._selected_group_refs()
         group_ref = selected_groups[0] if selected_groups else None
-        post_id_raw = self.post_id_input.text().strip()
+        post_id_raw = self.post_id_input.text().strip() if self.post_id_input.isVisible() else ""
 
         if not isinstance(group_ref, str) or not group_ref:
             self._set_action_result("выберите группу")
@@ -527,110 +778,205 @@ class MainWindow(QMainWindow):
         return group_ref, int(post_id_raw)
 
     def _send_comment_by_commentator(self) -> None:
-        record = self._find_record_by_role("commentator")
-        group_ref, post_id = self._resolve_base_context()
-        if record is None:
-            self._set_action_result("назначьте роль Комментатор на вкладке Аккаунты")
-            return
-        if group_ref is None or post_id is None:
-            return
-
-        comment_text = self.comment_input.toPlainText().strip()
-        if not comment_text:
-            self._set_action_result("введите текст комментария")
-            return
-
-        ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
-        if not ok or owner_id is None:
-            self._set_action_result(f"ошибка owner_id: {message}")
-            return
-
-        result = self.comment_service.post_comment(
-            account_token=record.token,
-            owner_id=owner_id,
-            post_id=post_id,
-            text=comment_text,
-        )
-        self._set_action_result(result.message)
-        self.statusBar().showMessage("Комментарий отправлен" if result.success else "Ошибка отправки комментария")
-
-    def _send_comment_like_by_liker(self) -> None:
-        record = self._find_record_by_role("liker")
-        group_ref, _post_id = self._resolve_base_context()
-        if record is None:
-            self._set_action_result("назначьте роль Лайкер на вкладке Аккаунты")
-            return
-        if group_ref is None:
-            return
-
-        comment_id_raw = self.comment_id_input.text().strip()
-        if not comment_id_raw.isdigit():
-            self._set_action_result("укажите корректный ID комментария (число)")
-            return
-        comment_id = int(comment_id_raw)
-
-        ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
-        if not ok or owner_id is None:
-            self._set_action_result(f"ошибка owner_id: {message}")
-            return
-
-        result = self.comment_service.add_like_to_comment(
-            account_token=record.token,
-            owner_id=owner_id,
-            comment_id=comment_id,
-        )
-        self._set_action_result(result.message)
-        self.statusBar().showMessage("Лайк комментария поставлен" if result.success else "Ошибка постановки лайка")
-
-    def _send_reply_by_replier(self) -> None:
-        record = self._find_record_by_role("replier")
-        group_ref, post_id = self._resolve_base_context()
-        if record is None:
-            self._set_action_result("назначьте роль Ответчик на вкладке Аккаунты")
-            return
-        if group_ref is None or post_id is None:
-            return
-
-        comment_id_raw = self.comment_id_input.text().strip()
-        if not comment_id_raw.isdigit():
-            self._set_action_result("укажите корректный ID комментария (число)")
-            return
-        comment_id = int(comment_id_raw)
-
-        reply_text = self.reply_input.toPlainText().strip()
-        if not reply_text:
-            self._set_action_result("введите текст ответа")
-            return
-
-        ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
-        if not ok or owner_id is None:
-            self._set_action_result(f"ошибка owner_id: {message}")
-            return
-
-        result = self.comment_service.reply_to_comment(
-            account_token=record.token,
-            owner_id=owner_id,
-            post_id=post_id,
-            reply_to_comment=comment_id,
-            text=reply_text,
-        )
-        self._set_action_result(result.message)
-        self.statusBar().showMessage("Ответ отправлен" if result.success else "Ошибка отправки ответа")
-
-    def _run_auto_scenario(self) -> None:
-        commentator_record = self._find_record_by_role("commentator")
-        liker_record = self._find_record_by_role("liker")
-        replier_record = self._find_record_by_role("replier")
         selected_groups = self._selected_group_refs()
         _group_ref, post_id = self._resolve_base_context(require_post_id=False)
-
-        if commentator_record is None:
+        per_group_post_id = post_id if len(selected_groups) == 1 else None
+        if not self._find_records_by_role("commentator"):
             self._set_action_result("назначьте роль Комментатор на вкладке Аккаунты")
             return
-        if liker_record is None:
+        if not selected_groups:
+            return
+
+        global_comment_text = self.comment_input.toPlainText().strip()
+        result_messages: list[str] = []
+        last_comment_id: int | None = None
+        last_post_id: int | None = None
+        for group_ref in selected_groups:
+            records = self._find_records_for_group("commentator", group_ref)
+            if not records:
+                result_messages.append(f"[{group_ref}] пропуск: нет разрешенного комментатора")
+                continue
+            record = random.choice(records)
+            pool = next((item for item in self.group_pools if item.group_id == group_ref), None)
+            comment_text = pool.comments[0] if pool and pool.comments else global_comment_text
+            if not comment_text:
+                result_messages.append(f"[{group_ref}] пропуск: пустой комментарий")
+                continue
+
+            ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
+            if not ok or owner_id is None:
+                result_messages.append(f"[{group_ref}] ошибка owner_id: {message}")
+                continue
+
+            selected_post_id = per_group_post_id
+            result_messages.append(f"=== Группа {group_ref} ===")
+            if selected_post_id is None:
+                prefer_pinned = True if not pool else pool.post_strategy != "latest"
+                post_result = self.comment_service.find_target_post(
+                    account_token=record.token,
+                    owner_id=owner_id,
+                    prefer_pinned=prefer_pinned,
+                )
+                result_messages.append(post_result.message)
+                if not post_result.success:
+                    continue
+                if not post_result.data or not isinstance(post_result.data.get("post_id"), int):
+                    result_messages.append("Не удалось получить post_id")
+                    continue
+                selected_post_id = int(post_result.data["post_id"])
+            last_post_id = selected_post_id
+
+            result = self.comment_service.post_comment(
+                account_token=record.token,
+                owner_id=owner_id,
+                post_id=selected_post_id,
+                text=comment_text,
+            )
+            if result.success and result.data and isinstance(result.data.get("comment_id"), int):
+                last_comment_id = int(result.data["comment_id"])
+                self.last_comment_ids_by_group[group_ref] = last_comment_id
+            result_messages.append(result.message)
+
+        if len(selected_groups) == 1:
+            group_ref = selected_groups[0]
+            saved_comment_id = self.last_comment_ids_by_group.get(group_ref)
+            if last_post_id is not None:
+                self.post_id_input.setText(str(last_post_id))
+            if saved_comment_id is not None:
+                self.comment_id_input.setText(str(saved_comment_id))
+        elif last_comment_id is not None:
+            self.comment_id_input.clear()
+
+        self._set_action_result("\n".join(result_messages) if result_messages else "Нет комментариев для отправки")
+        self.statusBar().showMessage("Комментарии обработаны")
+
+    def _send_comment_like_by_liker(self) -> None:
+        selected_groups = self._selected_group_refs()
+        _group_ref, _post_id = self._resolve_base_context(require_post_id=False)
+        if not self._find_records_by_role("liker"):
             self._set_action_result("назначьте роль Лайкер на вкладке Аккаунты")
             return
-        if replier_record is None:
+        if not selected_groups:
+            return
+
+        comment_id_raw = self.comment_id_input.text().strip()
+        if not self.comment_id_input.isVisible():
+            comment_id_raw = ""
+        field_comment_id = int(comment_id_raw) if comment_id_raw.isdigit() and len(selected_groups) == 1 else None
+        result_messages: list[str] = []
+        for group_ref in selected_groups:
+            records = self._find_records_for_group("liker", group_ref)
+            if not records:
+                result_messages.append(f"[{group_ref}] пропуск: нет разрешенного лайкера")
+                continue
+            record = random.choice(records)
+            comment_id = field_comment_id or self.last_comment_ids_by_group.get(group_ref)
+            if comment_id is None:
+                result_messages.append(f"[{group_ref}] пропуск: нет ID комментария")
+                continue
+
+            ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
+            if not ok or owner_id is None:
+                result_messages.append(f"[{group_ref}] ошибка owner_id: {message}")
+                continue
+
+            result_messages.append(f"=== Группа {group_ref} ===")
+            result = self.comment_service.add_like_to_comment(
+                account_token=record.token,
+                owner_id=owner_id,
+                comment_id=comment_id,
+            )
+            result_messages.append(result.message)
+
+        self._set_action_result("\n".join(result_messages) if result_messages else "Нет комментариев для лайка")
+        self.statusBar().showMessage("Лайки обработаны")
+
+    def _send_reply_by_replier(self) -> None:
+        selected_groups = self._selected_group_refs()
+        _group_ref, post_id = self._resolve_base_context(require_post_id=False)
+        per_group_post_id = post_id if len(selected_groups) == 1 else None
+        if not self._find_records_by_role("replier"):
+            self._set_action_result("назначьте роль Ответчик на вкладке Аккаунты")
+            return
+        if not selected_groups:
+            return
+
+        comment_id_raw = self.comment_id_input.text().strip()
+        if not self.comment_id_input.isVisible():
+            comment_id_raw = ""
+        field_comment_id = int(comment_id_raw) if comment_id_raw.isdigit() and len(selected_groups) == 1 else None
+        global_reply_text = self.reply_input.toPlainText().strip()
+        result_messages: list[str] = []
+        last_post_id: int | None = None
+        for group_ref in selected_groups:
+            records = self._find_records_for_group("replier", group_ref)
+            if not records:
+                result_messages.append(f"[{group_ref}] пропуск: нет разрешенного ответчика")
+                continue
+            record = random.choice(records)
+            pool = next((item for item in self.group_pools if item.group_id == group_ref), None)
+            comment_id = field_comment_id or self.last_comment_ids_by_group.get(group_ref)
+            if comment_id is None:
+                result_messages.append(f"[{group_ref}] пропуск: нет ID комментария")
+                continue
+
+            reply_text = pool.replies[0] if pool and pool.replies else (
+                pool.comments[0] if pool and pool.comments else global_reply_text
+            )
+            if not reply_text:
+                result_messages.append(f"[{group_ref}] пропуск: пустой ответ")
+                continue
+
+            ok, owner_id, message = self.comment_service.resolve_owner_id(record.token, group_ref)
+            if not ok or owner_id is None:
+                result_messages.append(f"[{group_ref}] ошибка owner_id: {message}")
+                continue
+
+            selected_post_id = per_group_post_id
+            result_messages.append(f"=== Группа {group_ref} ===")
+            if selected_post_id is None:
+                prefer_pinned = True if not pool else pool.post_strategy != "latest"
+                post_result = self.comment_service.find_target_post(
+                    account_token=record.token,
+                    owner_id=owner_id,
+                    prefer_pinned=prefer_pinned,
+                )
+                result_messages.append(post_result.message)
+                if not post_result.success:
+                    continue
+                if not post_result.data or not isinstance(post_result.data.get("post_id"), int):
+                    result_messages.append("Не удалось получить post_id")
+                    continue
+                selected_post_id = int(post_result.data["post_id"])
+            last_post_id = selected_post_id
+
+            result = self.comment_service.reply_to_comment(
+                account_token=record.token,
+                owner_id=owner_id,
+                post_id=selected_post_id,
+                reply_to_comment=comment_id,
+                text=reply_text,
+            )
+            result_messages.append(result.message)
+
+        if len(selected_groups) == 1 and last_post_id is not None:
+            self.post_id_input.setText(str(last_post_id))
+
+        self._set_action_result("\n".join(result_messages) if result_messages else "Нет ответов для отправки")
+        self.statusBar().showMessage("Ответы обработаны")
+
+    def _run_auto_scenario(self) -> None:
+        selected_groups = self._selected_group_refs()
+        _group_ref, post_id = self._resolve_base_context(require_post_id=False)
+        per_group_post_id = post_id if len(selected_groups) == 1 else None
+
+        if not self._find_records_by_role("commentator"):
+            self._set_action_result("назначьте роль Комментатор на вкладке Аккаунты")
+            return
+        if not self._find_records_by_role("liker"):
+            self._set_action_result("назначьте роль Лайкер на вкладке Аккаунты")
+            return
+        if not self._find_records_by_role("replier"):
             self._set_action_result("назначьте роль Ответчик на вкладке Аккаунты")
             return
         if not selected_groups:
@@ -668,13 +1014,29 @@ class MainWindow(QMainWindow):
                 logs.append(f"[{group_ref}] пропуск: пустой ответ")
                 continue
 
+            commentator_records = self._find_records_for_group("commentator", group_ref)
+            liker_records = self._find_records_for_group("liker", group_ref)
+            replier_records = self._find_records_for_group("replier", group_ref)
+            if not commentator_records:
+                logs.append(f"[{group_ref}] пропуск: нет разрешенного комментатора")
+                continue
+            if not liker_records:
+                logs.append(f"[{group_ref}] пропуск: нет разрешенного лайкера")
+                continue
+            if not replier_records:
+                logs.append(f"[{group_ref}] пропуск: нет разрешенного ответчика")
+                continue
+
+            commentator_record = random.choice(commentator_records)
+            liker_record = random.choice(liker_records)
+            replier_record = random.choice(replier_records)
             logs.append(f"=== Группа {group_ref} ===")
             result = self.automation_service.run_comment_like_reply_scenario(
                 commentator_token=commentator_record.token,
                 liker_token=liker_record.token,
                 replier_token=replier_record.token,
                 group_ref=group_ref,
-                post_id=post_id,
+                post_id=per_group_post_id,
                 comment_text=comment_text,
                 reply_text=reply_text,
                 prefer_pinned=prefer_pinned,
@@ -682,6 +1044,16 @@ class MainWindow(QMainWindow):
             )
             logs.extend(result.logs)
             last_result = result
+            self._register_monitoring_task(
+                group_ref=group_ref,
+                result=result,
+                comment_text=comment_text,
+                reply_text=reply_text,
+                prefer_pinned=prefer_pinned,
+                commentator_token=commentator_record.token,
+                replier_token=replier_record.token,
+                liker_token=liker_record.token,
+            )
             if result.requires_confirmation:
                 break
 
@@ -698,13 +1070,96 @@ class MainWindow(QMainWindow):
             requires_confirmation=last_result.requires_confirmation,
             redirect_uri=last_result.redirect_uri,
             comment_id=last_result.comment_id,
-            post_id=last_result.post_id,
+            post_id=last_result.post_id if len(selected_groups) == 1 else None,
         )
         self._apply_scenario_result(merged_result)
 
     def _continue_auto_scenario(self) -> None:
         result = self.automation_service.continue_pending_scenario()
         self._apply_scenario_result(result)
+
+    def _register_monitoring_task(
+        self,
+        group_ref: str,
+        result: ScenarioRunResult,
+        comment_text: str,
+        reply_text: str,
+        prefer_pinned: bool,
+        commentator_token: str,
+        replier_token: str,
+        liker_token: str | None,
+    ) -> None:
+        if result.comment_id is None or result.post_id is None or result.owner_id is None:
+            return
+        self.monitoring_service.register_task(
+            MonitoredTask(
+                group_ref=group_ref,
+                owner_id=result.owner_id,
+                post_id=result.post_id,
+                comment_text=comment_text,
+                reply_text=reply_text,
+                prefer_pinned=prefer_pinned,
+                commentator_token=commentator_token,
+                replier_token=replier_token,
+                liker_token=liker_token,
+                comment_id=result.comment_id,
+                reply_id=result.reply_id,
+            )
+        )
+
+    def _start_monitoring(self) -> None:
+        if not self.monitoring_service.has_tasks():
+            self._set_action_result("Нет задач мониторинга. Сначала запустите авто-сценарий.")
+            self.statusBar().showMessage("Мониторинг не запущен: нет задач")
+            return
+        self.monitoring_countdown_seconds = self.monitoring_timer.interval() // 1000
+        self.monitoring_timer.start()
+        self.monitoring_countdown_timer.start()
+        self._refresh_monitoring_status_label()
+        self._set_action_result("Мониторинг запущен")
+        self.statusBar().showMessage("Мониторинг запущен")
+
+    def _stop_monitoring(self) -> None:
+        self.monitoring_timer.stop()
+        self.monitoring_countdown_timer.stop()
+        self.monitoring_status_label.setText("Мониторинг: выключен")
+        self._set_action_result("Мониторинг остановлен")
+        self.statusBar().showMessage("Мониторинг остановлен")
+
+    def _update_monitoring_countdown(self) -> None:
+        if not self.monitoring_timer.isActive():
+            return
+        self.monitoring_countdown_seconds = max(0, self.monitoring_countdown_seconds - 1)
+        self._refresh_monitoring_status_label()
+
+    def _refresh_monitoring_status_label(self) -> None:
+        self.monitoring_status_label.setText(
+            f"Мониторинг: включен, следующая проверка через {self.monitoring_countdown_seconds} сек"
+        )
+
+    def _run_monitoring_tick(self) -> None:
+        if not self.monitoring_service.has_tasks():
+            self._stop_monitoring()
+            return
+
+        self.monitoring_countdown_seconds = self.monitoring_timer.interval() // 1000
+        self._refresh_monitoring_status_label()
+        result = self.monitoring_service.run_tick(self._select_monitoring_accounts)
+        self._set_action_result("\n".join(result.logs) if result.logs else "Мониторинг: нет событий")
+        if result.exhausted_messages:
+            QMessageBox.warning(
+                self,
+                "Мониторинг",
+                "Недостаточно аккаунтов для восстановления:\n" + "\n".join(result.exhausted_messages),
+            )
+
+    def _select_monitoring_accounts(
+        self,
+        role: str,
+        group_ref: str,
+        disabled_accounts: set[tuple[str, str]],
+    ) -> list[TokenRecord]:
+        return self._find_records_for_group_filtered(role, group_ref, disabled_accounts)
 
     def _apply_scenario_result(self, result: ScenarioRunResult) -> None:
         self._set_action_result("\n".join(result.logs))
@@ -719,7 +1174,22 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Автосценарий выполнен" if result.success else "Автосценарий завершился с ошибкой")
 
     def _set_action_result(self, text: str) -> None:
-        self.actions_result_output.setPlainText(text)
+        normalized_text = text.strip()
+        if not normalized_text:
+            return
+        now = datetime.now()
+        timestamp = now.strftime("%H:%M:%S")
+        current_minute = now.strftime("%H:%M")
+        lines = [line for line in normalized_text.splitlines() if line.strip()]
+        formatted = "\n".join(f"[{timestamp}] {line}" for line in lines)
+        current_text = self.actions_result_output.toPlainText().strip()
+        if not current_text or current_text == "-":
+            self.actions_result_output.setPlainText(formatted)
+        else:
+            if self.last_log_minute != current_minute:
+                self.actions_result_output.appendPlainText(f"\n----- Новые события {current_minute} -----")
+            self.actions_result_output.appendPlainText(formatted)
+        self.last_log_minute = current_minute
 
     def _copy_action_result(self) -> None:
         text = self.actions_result_output.toPlainText().strip()
