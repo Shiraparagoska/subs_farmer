@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -27,6 +28,9 @@ class MonitoredTask:
     liker_token: str | None = None
     comment_id: int | None = None
     reply_id: int | None = None
+    require_reply: bool = True
+    interval_seconds: int = 30
+    last_run_monotonic: float | None = None
 
 
 @dataclass(slots=True)
@@ -55,58 +59,85 @@ class MonitoringService:
     def has_tasks(self) -> bool:
         return bool(self.tasks_by_group)
 
+    def seconds_until_next_check(self) -> int:
+        """Секунд до ближайшей проверки любой задачи (0 — можно проверять сразу)."""
+        now = time.monotonic()
+        best: float | None = None
+        for task in self.tasks_by_group.values():
+            interval = max(30, int(task.interval_seconds))
+            if task.last_run_monotonic is None:
+                return 0
+            elapsed = now - task.last_run_monotonic
+            remaining = max(0.0, float(interval) - elapsed)
+            if best is None or remaining < best:
+                best = remaining
+        return int(best) if best is not None else 0
+
     def run_tick(self, account_selector: AccountSelector) -> MonitoringTickResult:
         logs: list[str] = []
         exhausted_messages: list[str] = []
+        now = time.monotonic()
 
         for task in list(self.tasks_by_group.values()):
+            interval = max(30, int(task.interval_seconds))
+            if task.last_run_monotonic is not None:
+                if now - task.last_run_monotonic < interval:
+                    continue
+
             logs.append(f"=== Мониторинг {task.group_ref} ===")
-            check_token = self._pick_check_token(task, account_selector)
-            if check_token is None:
-                message = f"[{task.group_ref}] нет доступного аккаунта для проверки"
-                logs.append(message)
-                exhausted_messages.append(message)
-                continue
+            try:
+                check_token = self._pick_check_token(task, account_selector)
+                if check_token is None:
+                    message = f"[{task.group_ref}] нет доступного аккаунта для проверки"
+                    logs.append(message)
+                    exhausted_messages.append(message)
+                    continue
 
-            if task.comment_id is None:
-                self._restore_comment_tree(task, account_selector, logs, exhausted_messages)
-                continue
+                if task.comment_id is None:
+                    self._restore_comment_tree(task, account_selector, logs, exhausted_messages)
+                    continue
 
-            comment_check = self.comment_service.comment_exists(
-                account_token=check_token,
-                owner_id=task.owner_id,
-                post_id=task.post_id,
-                comment_id=task.comment_id,
-            )
-            if not comment_check.success:
-                logs.append(comment_check.message)
-                self._disable_if_account_error("commentator", check_token, comment_check)
-                continue
-            if not self._exists(comment_check):
-                logs.append(f"[{task.group_ref}] основной комментарий удален, восстанавливаю")
-                self._restore_comment_tree(task, account_selector, logs, exhausted_messages)
-                continue
+                comment_check = self.comment_service.comment_exists(
+                    account_token=check_token,
+                    owner_id=task.owner_id,
+                    post_id=task.post_id,
+                    comment_id=task.comment_id,
+                )
+                if not comment_check.success:
+                    logs.append(comment_check.message)
+                    self._disable_if_account_error(None, check_token, comment_check)
+                    continue
+                if not self._exists(comment_check):
+                    logs.append(f"[{task.group_ref}] основной комментарий удален, восстанавливаю")
+                    self._restore_comment_tree(task, account_selector, logs, exhausted_messages)
+                    continue
 
-            if task.reply_id is None:
-                self._restore_reply(task, account_selector, logs, exhausted_messages)
-                continue
+                if not task.require_reply:
+                    logs.append(f"[{task.group_ref}] комментарий на месте (ответ не используется)")
+                    continue
 
-            reply_check = self.comment_service.reply_exists(
-                account_token=check_token,
-                owner_id=task.owner_id,
-                parent_comment_id=task.comment_id,
-                reply_id=task.reply_id,
-            )
-            if not reply_check.success:
-                logs.append(reply_check.message)
-                self._disable_if_account_error("replier", check_token, reply_check)
-                continue
-            if not self._exists(reply_check):
-                logs.append(f"[{task.group_ref}] ответ удален, восстанавливаю")
-                self._restore_reply(task, account_selector, logs, exhausted_messages)
-                continue
+                if task.reply_id is None:
+                    self._restore_reply(task, account_selector, logs, exhausted_messages)
+                    continue
 
-            logs.append(f"[{task.group_ref}] комментарий и ответ на месте")
+                reply_check = self.comment_service.reply_exists(
+                    account_token=check_token,
+                    owner_id=task.owner_id,
+                    parent_comment_id=task.comment_id,
+                    reply_id=task.reply_id,
+                )
+                if not reply_check.success:
+                    logs.append(reply_check.message)
+                    self._disable_if_account_error(None, check_token, reply_check)
+                    continue
+                if not self._exists(reply_check):
+                    logs.append(f"[{task.group_ref}] ответ удален, восстанавливаю")
+                    self._restore_reply(task, account_selector, logs, exhausted_messages)
+                    continue
+
+                logs.append(f"[{task.group_ref}] комментарий и ответ на месте")
+            finally:
+                task.last_run_monotonic = time.monotonic()
 
         return MonitoringTickResult(logs=logs, exhausted_messages=exhausted_messages)
 
@@ -126,7 +157,8 @@ class MonitoringService:
         task.reply_id = None
         if not self._restore_comment(task, account_selector, logs, exhausted_messages):
             return
-        self._restore_reply(task, account_selector, logs, exhausted_messages)
+        if task.require_reply:
+            self._restore_reply(task, account_selector, logs, exhausted_messages)
         self._try_like(task, account_selector, logs)
 
     def _delete_old_comment(
@@ -171,7 +203,7 @@ class MonitoringService:
                 task.comment_id = int(result.data["comment_id"])
                 task.commentator_token = record.token
                 return True
-            self._disable_if_account_error("commentator", record.token, result)
+            self._disable_if_account_error(record.role, record.token, result)
 
         message = f"[{task.group_ref}] комментаторы закончились"
         logs.append(message)
@@ -208,7 +240,7 @@ class MonitoringService:
                 task.reply_id = int(result.data["comment_id"])
                 task.replier_token = record.token
                 return True
-            self._disable_if_account_error("replier", record.token, result)
+            self._disable_if_account_error(record.role, record.token, result)
 
         message = f"[{task.group_ref}] ответчики закончились"
         logs.append(message)
@@ -229,12 +261,13 @@ class MonitoringService:
                 account_token=record.token,
                 owner_id=task.owner_id,
                 comment_id=task.comment_id,
+                post_id=task.post_id,
             )
             logs.append(result.message)
             if result.success:
                 task.liker_token = record.token
                 return
-            self._disable_if_account_error("liker", record.token, result)
+            self._disable_if_account_error(record.role, record.token, result)
 
     def _pick_check_token(self, task: MonitoredTask, account_selector: AccountSelector) -> str | None:
         for role, token in (
@@ -242,7 +275,7 @@ class MonitoringService:
             ("replier", task.replier_token),
             ("liker", task.liker_token),
         ):
-            if token and (role, token) not in self.disabled_accounts:
+            if token and not self._token_is_disabled(token):
                 return token
 
         for role in ("commentator", "replier", "liker"):
@@ -251,10 +284,14 @@ class MonitoringService:
                 return records[0].token
         return None
 
-    def _disable_if_account_error(self, role: str, token: str, result: ActionResult) -> None:
+    def _disable_if_account_error(self, role: str | None, token: str, result: ActionResult) -> None:
         if result.success:
             return
         if self._is_account_error(result):
+            if role is None:
+                for role_name in ("commentator", "replier", "liker"):
+                    self.disabled_accounts.add((role_name, token))
+                return
             self.disabled_accounts.add((role, token))
 
     @staticmethod
@@ -268,6 +305,9 @@ class MonitoringService:
     @staticmethod
     def _exists(result: ActionResult) -> bool:
         return bool(result.data and result.data.get("exists") is True)
+
+    def _token_is_disabled(self, token: str) -> bool:
+        return any(saved_token == token for _role, saved_token in self.disabled_accounts)
 
     @staticmethod
     def _shuffled(records: list[TokenRecord]) -> list[TokenRecord]:

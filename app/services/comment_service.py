@@ -91,8 +91,43 @@ class CommentService:
             data={"likes": likes_count},
         )
 
-    def add_like_to_comment(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
+    def add_like_to_comment(
+        self,
+        account_token: str,
+        owner_id: int,
+        comment_id: int,
+        post_id: int | None = None,
+    ) -> ActionResult:
         """Ставит лайк на комментарий."""
+        primary = self._likes_add_comment(account_token, owner_id, comment_id)
+        if primary.success:
+            return primary
+
+        if post_id is None:
+            return primary
+        fallback_owner_id = self._resolve_comment_author_id(
+            account_token=account_token,
+            wall_owner_id=owner_id,
+            post_id=post_id,
+            comment_id=comment_id,
+        )
+        if fallback_owner_id is None or fallback_owner_id == owner_id:
+            return primary
+
+        retry = self._likes_add_comment(account_token, fallback_owner_id, comment_id)
+        if retry.success:
+            return ActionResult(
+                success=True,
+                message=f"{retry.message} (owner_id fallback: {owner_id} -> {fallback_owner_id})",
+                data=retry.data,
+            )
+        return ActionResult(
+            success=False,
+            message=f"{primary.message} | fallback owner_id={fallback_owner_id}: {retry.message}",
+            data=retry.data or primary.data,
+        )
+
+    def _likes_add_comment(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
         try:
             response = self.vk_client.call_method(
                 method="likes.add",
@@ -109,21 +144,99 @@ class CommentService:
 
         error_data = response.get("error")
         if error_data:
-            return ActionResult(
+            base_result = ActionResult(
                 success=False,
                 message=self._format_vk_error(error_data, method="likes.add"),
                 data=self._extract_error_data(error_data),
             )
-
+            if base_result.data and base_result.data.get("error_code") == 3:
+                execute_result = self._likes_add_comment_via_execute(account_token, owner_id, comment_id)
+                if execute_result.success:
+                    return ActionResult(
+                        success=True,
+                        message=f"{execute_result.message} (fallback execute)",
+                        data=execute_result.data,
+                    )
+                return ActionResult(
+                    success=False,
+                    message=f"{base_result.message} | execute fallback: {execute_result.message}",
+                    data=execute_result.data or base_result.data,
+                )
+            return base_result
         likes_count = response.get("response", {}).get("likes")
         if likes_count is None:
             return ActionResult(success=False, message="VK API не вернул число лайков комментария")
-
         return ActionResult(
             success=True,
             message=f"Лайк комментария поставлен, всего лайков: {likes_count}",
             data={"likes": likes_count},
         )
+
+    def _likes_add_comment_via_execute(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
+        code = (
+            "var r = API.likes.add({"
+            f"\"type\":\"comment\",\"owner_id\":{owner_id},\"item_id\":{comment_id}"
+            "});"
+            "return r;"
+        )
+        try:
+            response = self.vk_client.call_method(
+                method="execute",
+                token=account_token,
+                params={"code": code},
+                request_method="POST",
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data, method="execute"),
+                data=self._extract_error_data(error_data),
+            )
+        likes_count = response.get("response", {}).get("likes")
+        if likes_count is None:
+            return ActionResult(success=False, message="VK API execute не вернул число лайков")
+        return ActionResult(
+            success=True,
+            message=f"Лайк комментария поставлен, всего лайков: {likes_count}",
+            data={"likes": likes_count},
+        )
+
+    def _resolve_comment_author_id(
+        self,
+        account_token: str,
+        wall_owner_id: int,
+        post_id: int,
+        comment_id: int,
+    ) -> int | None:
+        try:
+            response = self.vk_client.call_method(
+                method="wall.getComments",
+                token=account_token,
+                params={
+                    "owner_id": wall_owner_id,
+                    "post_id": post_id,
+                    "start_comment_id": comment_id,
+                    "count": 10,
+                    "sort": "asc",
+                },
+            )
+        except RuntimeError:
+            return None
+
+        error_data = response.get("error")
+        if error_data:
+            return None
+        items = response.get("response", {}).get("items", [])
+        for item in items:
+            if not isinstance(item, dict) or item.get("id") != comment_id:
+                continue
+            from_id = item.get("from_id")
+            if isinstance(from_id, int):
+                return from_id
+        return None
 
     def reply_to_comment(
         self,

@@ -15,6 +15,7 @@ class GroupCommentsPool:
     comments: list[str] = field(default_factory=list)
     replies: list[str] = field(default_factory=list)
     post_strategy: str = "pinned"
+    monitoring_interval_seconds: int = 30
 
 
 class PoolsRepository:
@@ -37,6 +38,13 @@ class PoolsRepository:
             replies = [str(reply).strip() for reply in item.get("replies", []) if str(reply).strip()]
             raw_strategy = str(item.get("post_strategy", "pinned")).strip().lower()
             post_strategy = raw_strategy if raw_strategy in {"pinned", "latest"} else "pinned"
+            raw_interval = item.get("monitoring_interval_seconds", 30)
+            try:
+                monitoring_interval_seconds = int(raw_interval)
+            except (TypeError, ValueError):
+                monitoring_interval_seconds = 30
+            if monitoring_interval_seconds < 30:
+                monitoring_interval_seconds = 30
             if group_id:
                 result.append(
                     GroupCommentsPool(
@@ -44,6 +52,7 @@ class PoolsRepository:
                         comments=comments,
                         replies=replies,
                         post_strategy=post_strategy,
+                        monitoring_interval_seconds=monitoring_interval_seconds,
                     )
                 )
 
@@ -57,6 +66,7 @@ class PoolsRepository:
                     "comments": pool.comments,
                     "replies": pool.replies,
                     "post_strategy": pool.post_strategy,
+                    "monitoring_interval_seconds": pool.monitoring_interval_seconds,
                 }
                 for pool in pools
             ]

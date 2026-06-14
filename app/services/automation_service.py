@@ -34,6 +34,7 @@ class ScenarioContext:
     post_id: int
     comment_text: str
     reply_text: str
+    reply_required: bool
     delay_seconds: float
     owner_id: int
     comment_id: int | None = None
@@ -59,6 +60,7 @@ class AutomationService:
         reply_text: str,
         prefer_pinned: bool = True,
         delay_seconds: float = 3,
+        reply_required: bool = True,
     ) -> ScenarioRunResult:
         normalized_delay = max(0.0, float(delay_seconds))
 
@@ -99,6 +101,7 @@ class AutomationService:
             post_id=resolved_post_id,
             comment_text=comment_text,
             reply_text=reply_text,
+            reply_required=reply_required,
             delay_seconds=normalized_delay,
             owner_id=owner_id,
         )
@@ -154,14 +157,24 @@ class AutomationService:
                         owner_id=context.owner_id,
                     )
                 self._pending_context = None
-                return ScenarioRunResult(success=False, message="Сценарий остановлен на комментарии", logs=logs)
+                return ScenarioRunResult(
+                    success=False,
+                    message="Сценарий остановлен на комментарии",
+                    logs=logs,
+                    comment_id=context.comment_id,
+                    reply_id=context.reply_id,
+                    post_id=context.post_id,
+                    owner_id=context.owner_id,
+                )
 
             context.comment_id = self._extract_comment_id(comment_result)
             if context.comment_id is None:
                 logs.append("Не удалось получить ID комментария из результата")
                 self._pending_context = None
                 return ScenarioRunResult(success=False, message="Нет comment_id для следующих шагов", logs=logs)
-            context.next_step = "reply"
+            context.next_step = "reply" if context.reply_required else "like"
+            if not context.reply_required:
+                logs.append("Ответ не требуется — шаг ответа пропущен")
             if context.delay_seconds > 0:
                 time.sleep(context.delay_seconds)
 
@@ -194,7 +207,15 @@ class AutomationService:
                         owner_id=context.owner_id,
                     )
                 self._pending_context = None
-                return ScenarioRunResult(success=False, message="Сценарий остановлен на ответе", logs=logs)
+                return ScenarioRunResult(
+                    success=False,
+                    message="Сценарий остановлен на ответе",
+                    logs=logs,
+                    comment_id=context.comment_id,
+                    reply_id=context.reply_id,
+                    post_id=context.post_id,
+                    owner_id=context.owner_id,
+                )
             context.next_step = "like"
             if context.delay_seconds > 0:
                 time.sleep(context.delay_seconds)
@@ -207,6 +228,7 @@ class AutomationService:
                 account_token=context.liker_token,
                 owner_id=context.owner_id,
                 comment_id=context.comment_id,
+                post_id=context.post_id,
             )
             logs.append(like_result.message)
             if not like_result.success:
@@ -224,7 +246,11 @@ class AutomationService:
                         owner_id=context.owner_id,
                     )
                 self._pending_context = None
-                logs.append("Лайк не поставлен, но комментарий и ответ уже отправлены")
+                logs.append(
+                    "Лайк не поставлен, но комментарий и ответ уже отправлены"
+                    if context.reply_required
+                    else "Лайк не поставлен, но комментарий уже отправлен"
+                )
                 return ScenarioRunResult(
                     success=False,
                     message="Сценарий остановлен на лайке",

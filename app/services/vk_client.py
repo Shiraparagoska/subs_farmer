@@ -38,7 +38,18 @@ class VkClient:
         query = urlencode(request_params)
         url = f"https://api.vk.com/method/{method}"
         normalized_request_method = request_method.upper()
-        if normalized_request_method == "POST":
+        parsed = self._perform_request(url=url, query=query, request_method=normalized_request_method)
+        error_data = parsed.get("error")
+        if (
+            normalized_request_method == "POST"
+            and isinstance(error_data, dict)
+            and error_data.get("error_code") == 3
+        ):
+            return self._perform_request(url=url, query=query, request_method="GET")
+        return parsed
+
+    def _perform_request(self, url: str, query: str, request_method: str) -> dict[str, Any]:
+        if request_method == "POST":
             request = Request(
                 url,
                 data=query.encode("utf-8"),
@@ -47,7 +58,6 @@ class VkClient:
             )
         else:
             request = Request(f"{url}?{query}", method="GET")
-
         try:
             with urlopen(request, timeout=self.config.timeout_seconds) as response:
                 raw_data = response.read().decode("utf-8")
@@ -55,10 +65,8 @@ class VkClient:
             raise RuntimeError(f"HTTP ошибка VK API: {error.code}") from error
         except URLError as error:
             raise RuntimeError(f"Сетевая ошибка VK API: {error.reason}") from error
-
         try:
             parsed: dict[str, Any] = json.loads(raw_data)
         except json.JSONDecodeError as error:
             raise RuntimeError("VK API вернул некорректный JSON") from error
-
         return parsed
