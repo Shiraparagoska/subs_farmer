@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import re
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from app.services.vk_client import VkClient
 
@@ -20,20 +25,42 @@ class ActionResult:
 class CommentService:
     """Координирует ручные действия комментариев и лайков."""
 
+    _YOUTUBE_ID_RE = re.compile(
+        r"(?:youtube\.com/(?:watch\?.*?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{6,})",
+        re.IGNORECASE,
+    )
+
     def __init__(self, vk_client: VkClient | None = None) -> None:
         self.vk_client = vk_client or VkClient()
 
-    def post_comment(self, account_token: str, owner_id: int, post_id: int, text: str) -> ActionResult:
+    def post_comment(
+        self,
+        account_token: str,
+        owner_id: int,
+        post_id: int,
+        text: str,
+        photo_path: str | Path | None = None,
+    ) -> ActionResult:
         """Оставляет комментарий под постом сообщества/пользователя."""
+        params: dict[str, Any] = {
+            "owner_id": owner_id,
+            "post_id": post_id,
+            "message": text,
+        }
+        if photo_path:
+            attachment_result = self.upload_wall_photo(account_token, Path(photo_path))
+            if not attachment_result.success:
+                return attachment_result
+            attachment = (attachment_result.data or {}).get("attachment")
+            if not isinstance(attachment, str) or not attachment:
+                return ActionResult(success=False, message="Не удалось получить attachment фото")
+            params["attachments"] = attachment
+
         try:
             response = self.vk_client.call_method(
                 method="wall.createComment",
                 token=account_token,
-                params={
-                    "owner_id": owner_id,
-                    "post_id": post_id,
-                    "message": text,
-                },
+                params=params,
                 request_method="POST",
             )
         except RuntimeError as error:
@@ -51,11 +78,13 @@ class CommentService:
         if comment_id is None:
             return ActionResult(success=False, message="VK API не вернул comment_id")
 
+        suffix = " +фото" if photo_path else ""
         return ActionResult(
             success=True,
-            message=f"Комментарий отправлен, id={comment_id}",
+            message=f"Комментарий отправлен{suffix}, id={comment_id}",
             data={"comment_id": comment_id},
         )
+
 
     def add_like(self, account_token: str, owner_id: int, post_id: int) -> ActionResult:
         """Ставит лайк на пост."""
@@ -245,18 +274,29 @@ class CommentService:
         post_id: int,
         reply_to_comment: int,
         text: str,
+        photo_path: str | Path | None = None,
     ) -> ActionResult:
         """Отправляет ответ на комментарий под постом."""
+        params: dict[str, Any] = {
+            "owner_id": owner_id,
+            "post_id": post_id,
+            "reply_to_comment": reply_to_comment,
+            "message": text,
+        }
+        if photo_path:
+            attachment_result = self.upload_wall_photo(account_token, Path(photo_path))
+            if not attachment_result.success:
+                return attachment_result
+            attachment = (attachment_result.data or {}).get("attachment")
+            if not isinstance(attachment, str) or not attachment:
+                return ActionResult(success=False, message="Не удалось получить attachment фото")
+            params["attachments"] = attachment
+
         try:
             response = self.vk_client.call_method(
                 method="wall.createComment",
                 token=account_token,
-                params={
-                    "owner_id": owner_id,
-                    "post_id": post_id,
-                    "reply_to_comment": reply_to_comment,
-                    "message": text,
-                },
+                params=params,
                 request_method="POST",
             )
         except RuntimeError as error:
@@ -273,11 +313,13 @@ class CommentService:
         comment_id = response.get("response", {}).get("comment_id")
         if comment_id is None:
             return ActionResult(success=False, message="VK API не вернул id ответа")
+        suffix = " +фото" if photo_path else ""
         return ActionResult(
             success=True,
-            message=f"Ответ отправлен, id={comment_id}",
+            message=f"Ответ отправлен{suffix}, id={comment_id}",
             data={"comment_id": comment_id},
         )
+
 
     def delete_comment(self, account_token: str, owner_id: int, comment_id: int) -> ActionResult:
         """Удаляет комментарий/ответ со стены, если у аккаунта есть права."""
@@ -414,6 +456,54 @@ class CommentService:
             message = f"Закрепленный пост не найден, взят последний пост, id={post_id}"
         return ActionResult(success=True, message=message, data={"post_id": post_id, "source": source})
 
+    def list_wall_posts(
+        self,
+        account_token: str,
+        owner_id: int,
+        limit: int = 10,
+    ) -> ActionResult:
+        """Возвращает последние посты стены (id и признак закрепа)."""
+        request_limit = max(1, min(limit, 50))
+        try:
+            response = self.vk_client.call_method(
+                method="wall.get",
+                token=account_token,
+                params={
+                    "owner_id": owner_id,
+                    "count": request_limit,
+                },
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data, method="wall.get"),
+                data=self._extract_error_data(error_data),
+            )
+
+        payload = response.get("response", {})
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            return ActionResult(success=False, message="VK API не вернул список постов")
+
+        posts: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            post_id = item.get("id")
+            if not isinstance(post_id, int):
+                continue
+            posts.append(
+                {
+                    "id": post_id,
+                    "is_pinned": item.get("is_pinned") == 1,
+                }
+            )
+        return ActionResult(success=True, message=f"Получено постов: {len(posts)}", data={"posts": posts})
+
     def comment_exists(self, account_token: str, owner_id: int, post_id: int, comment_id: int) -> ActionResult:
         """Проверяет, существует ли комментарий к посту."""
         return self._comment_exists(
@@ -445,6 +535,153 @@ class CommentService:
             },
             label=f"Ответ id={reply_id}",
         )
+
+    def upload_wall_photo(self, account_token: str, photo_path: Path) -> ActionResult:
+        """Загружает фото на стену пользователя и возвращает attachment вида photo{owner}_{id}."""
+        if not photo_path.exists() or not photo_path.is_file():
+            return ActionResult(success=False, message=f"Файл фото не найден: {photo_path}")
+
+        try:
+            server_response = self.vk_client.call_method(
+                method="photos.getWallUploadServer",
+                token=account_token,
+                params={},
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        error_data = server_response.get("error")
+        if error_data:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(error_data, method="photos.getWallUploadServer"),
+                data=self._extract_error_data(error_data),
+            )
+
+        upload_url = (server_response.get("response") or {}).get("upload_url")
+        if not isinstance(upload_url, str) or not upload_url.strip():
+            return ActionResult(success=False, message="VK не вернул upload_url для фото")
+
+        try:
+            upload_payload = self.vk_client.upload_file(upload_url, "photo", photo_path)
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        if isinstance(upload_payload.get("error"), str):
+            return ActionResult(success=False, message=f"Upload-сервер: {upload_payload['error']}")
+
+        server = upload_payload.get("server")
+        photo = upload_payload.get("photo")
+        photo_hash = upload_payload.get("hash")
+
+        # Иногда VK отдаёт объект/массив — saveWallPhoto ждёт строку JSON.
+        if isinstance(photo, (dict, list)):
+            photo = json.dumps(photo, ensure_ascii=False, separators=(",", ":"))
+        if isinstance(photo, str):
+            photo = photo.strip()
+        if server is None or photo_hash is None or not photo or photo in {"[]", "null", "None"}:
+            return ActionResult(
+                success=False,
+                message=(
+                    "Upload-сервер вернул пустое photo "
+                    f"(server={server!r}, photo={photo!r}, hash={photo_hash!r}). "
+                    "Попробуй jpg вместо png или другое имя файла."
+                ),
+            )
+
+        try:
+            save_response = self.vk_client.call_method_raw_params(
+                method="photos.saveWallPhoto",
+                token=account_token,
+                params={
+                    "server": server,
+                    "photo": photo,
+                    "hash": photo_hash,
+                },
+            )
+        except RuntimeError as error:
+            return ActionResult(success=False, message=str(error))
+
+        save_error = save_response.get("error")
+        if save_error:
+            return ActionResult(
+                success=False,
+                message=self._format_vk_error(save_error, method="photos.saveWallPhoto"),
+                data=self._extract_error_data(save_error),
+            )
+
+        saved_items = save_response.get("response")
+        if not isinstance(saved_items, list) or not saved_items:
+            return ActionResult(success=False, message="photos.saveWallPhoto вернул пустой ответ")
+
+        saved = saved_items[0]
+        owner_id = saved.get("owner_id")
+        photo_id = saved.get("id")
+        if not isinstance(owner_id, int) or not isinstance(photo_id, int):
+            return ActionResult(success=False, message="photos.saveWallPhoto не вернул id фото")
+
+        attachment = f"photo{owner_id}_{photo_id}"
+        return ActionResult(
+            success=True,
+            message=f"Фото загружено: {attachment}",
+            data={"attachment": attachment, "owner_id": owner_id, "photo_id": photo_id},
+        )
+
+    def download_youtube_thumbnail(self, text_or_url: str, target_path: Path | None = None) -> ActionResult:
+        """Скачивает превью YouTube по ссылке из текста. Возвращает путь к jpg."""
+        video_id = self.extract_youtube_video_id(text_or_url)
+        if not video_id:
+            return ActionResult(success=False, message="В тексте нет ссылки YouTube")
+
+        candidates = (
+            f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg",
+            f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+            f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg",
+        )
+        last_error = "Не удалось скачать превью YouTube"
+        image_bytes: bytes | None = None
+        for url in candidates:
+            try:
+                raw = self.vk_client.download_bytes(url)
+            except RuntimeError as error:
+                last_error = str(error)
+                continue
+            # Заглушка YouTube ~1KB; нормальное превью заметно больше.
+            if len(raw) < 5000:
+                last_error = "Превью YouTube недоступно (заглушка)"
+                continue
+            image_bytes = raw
+            break
+
+        if image_bytes is None:
+            return ActionResult(success=False, message=last_error)
+
+        output = target_path or Path(tempfile.gettempdir()) / f"vk_yt_{video_id}.jpg"
+        try:
+            output.write_bytes(image_bytes)
+        except OSError as error:
+            return ActionResult(success=False, message=f"Не удалось сохранить превью: {error}")
+
+        return ActionResult(
+            success=True,
+            message=f"Превью YouTube сохранено: {output.name}",
+            data={"path": str(output), "video_id": video_id},
+        )
+
+    @classmethod
+    def extract_youtube_video_id(cls, text_or_url: str) -> str | None:
+        value = (text_or_url or "").strip()
+        if not value:
+            return None
+        match = cls._YOUTUBE_ID_RE.search(value)
+        if match:
+            return match.group(1)
+        parsed = urlparse(value)
+        if "youtube.com" in parsed.netloc.lower():
+            query_id = parse_qs(parsed.query).get("v", [None])[0]
+            if isinstance(query_id, str) and query_id.strip():
+                return query_id.strip()
+        return None
 
     def _comment_exists(
         self,

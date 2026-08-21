@@ -170,8 +170,17 @@ class MainWindow(QMainWindow):
 
         self._fill_tokens_table()
         valid_count = sum(1 for record in self.token_records if record.is_valid)
+        blocked_count = sum(
+            1
+            for record in self.token_records
+            if not record.is_valid
+            and record.last_error
+            and ("заблокирован" in record.last_error.lower() or "user is blocked" in record.last_error.lower())
+        )
+        invalid_count = len(self.token_records) - valid_count
         self.statusBar().showMessage(
-            f"Проверка завершена: валидных {valid_count} из {len(self.token_records)}"
+            f"Проверка завершена: рабочих {valid_count} из {len(self.token_records)}"
+            f" (невалидных {invalid_count}, из них в бане {blocked_count})"
         )
 
     def _check_likes(self) -> None:
@@ -386,10 +395,14 @@ class MainWindow(QMainWindow):
             )
             self.tokens_table.setCellWidget(row_index, 2, groups_button)
 
-            if record.last_error:
-                status_text = "Ошибка"
-            elif record.is_valid:
+            if record.is_valid:
                 status_text = "Валидный"
+            elif record.last_error and (
+                "заблокирован" in record.last_error.lower() or "user is blocked" in record.last_error.lower()
+            ):
+                status_text = "В бане"
+            elif record.last_error:
+                status_text = "Ошибка"
             else:
                 status_text = "Не проверен"
             self.tokens_table.setItem(row_index, 3, QTableWidgetItem(status_text))
@@ -604,6 +617,23 @@ class MainWindow(QMainWindow):
         self.delay_input.setText("3")
         layout.addWidget(delay_label)
         layout.addWidget(self.delay_input)
+
+        photo_label = QLabel("Фото к комментарию (превью; YouTube в комменте сам не встраивается):")
+        layout.addWidget(photo_label)
+        photo_row = QHBoxLayout()
+        self.comment_photo_input = QLineEdit()
+        self.comment_photo_input.setPlaceholderText("Путь к jpg/png или скачай превью YouTube")
+        photo_row.addWidget(self.comment_photo_input)
+        pick_photo_button = QPushButton("Выбрать...")
+        pick_photo_button.clicked.connect(self._pick_comment_photo)
+        photo_row.addWidget(pick_photo_button)
+        yt_thumb_button = QPushButton("Превью из YouTube")
+        yt_thumb_button.clicked.connect(self._download_youtube_preview_for_comment)
+        photo_row.addWidget(yt_thumb_button)
+        clear_photo_button = QPushButton("Очистить")
+        clear_photo_button.clicked.connect(lambda: self.comment_photo_input.clear())
+        photo_row.addWidget(clear_photo_button)
+        layout.addLayout(photo_row)
 
         button_row = QHBoxLayout()
         comment_button = QPushButton("Комментатор: оставить комментарий")
@@ -937,6 +967,63 @@ class MainWindow(QMainWindow):
                 selector.addItem(item)
             selector.blockSignals(False)
 
+    def _selected_comment_photo_path(self) -> str | None:
+        if not hasattr(self, "comment_photo_input"):
+            return None
+        value = self.comment_photo_input.text().strip()
+        if not value:
+            return None
+        path = Path(value)
+        if not path.exists() or not path.is_file():
+            return None
+        return str(path)
+
+    def _pick_comment_photo(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выберите фото для комментария",
+            "",
+            "Images (*.jpg *.jpeg *.png *.webp);;All files (*.*)",
+        )
+        if file_path:
+            self.comment_photo_input.setText(file_path)
+            self.statusBar().showMessage(f"Фото к комментарию: {Path(file_path).name}")
+
+    def _download_youtube_preview_for_comment(self) -> None:
+        candidates: list[str] = []
+        if hasattr(self, "comment_input"):
+            candidates.append(self.comment_input.toPlainText())
+        if hasattr(self, "reply_input"):
+            candidates.append(self.reply_input.toPlainText())
+        for group_ref in self._selected_group_refs():
+            pool = next((item for item in self.group_pools if item.group_id == group_ref), None)
+            if pool and pool.comments:
+                candidates.extend(pool.comments)
+            if pool and pool.replies:
+                candidates.extend(pool.replies)
+
+        source_text = next(
+            (text for text in candidates if CommentService.extract_youtube_video_id(text)),
+            "",
+        )
+        if not source_text:
+            QMessageBox.information(
+                self,
+                "YouTube превью",
+                "Не нашёл ссылку YouTube в тексте комментария/пуле.\n"
+                "Вставь ссылку в комментарий пула или в поле текста, затем нажми снова.",
+            )
+            return
+
+        result = self.comment_service.download_youtube_thumbnail(source_text)
+        if not result.success or not result.data or not isinstance(result.data.get("path"), str):
+            QMessageBox.warning(self, "YouTube превью", result.message)
+            return
+
+        self.comment_photo_input.setText(result.data["path"])
+        self.statusBar().showMessage(result.message)
+        self._set_action_result(result.message)
+
     def _resolve_base_context(self, require_post_id: bool = True) -> tuple[str | None, int | None]:
         selected_groups = self._selected_group_refs()
         group_ref = selected_groups[0] if selected_groups else None
@@ -1013,6 +1100,7 @@ class MainWindow(QMainWindow):
                 owner_id=owner_id,
                 post_id=selected_post_id,
                 text=comment_text,
+                photo_path=self._selected_comment_photo_path(),
             )
             if result.success and result.data and isinstance(result.data.get("comment_id"), int):
                 last_comment_id = int(result.data["comment_id"])
@@ -1249,6 +1337,7 @@ class MainWindow(QMainWindow):
                 prefer_pinned=prefer_pinned,
                 delay_seconds=delay_seconds,
                 reply_required=require_reply,
+                photo_path=self._selected_comment_photo_path(),
             )
             if (
                 require_reply
@@ -1409,6 +1498,10 @@ class MainWindow(QMainWindow):
             return
         pool = next((p for p in self.group_pools if p.group_id == group_ref), None)
         interval_sec = pool.monitoring_interval_seconds if pool else 30
+        # Новые посты: стратегия "только последний" ИЛИ закреп не нашёлся и взяли крайний.
+        track_new_posts = (not prefer_pinned) or any(
+            "Закрепленный пост не найден" in line for line in result.logs
+        )
         self.monitoring_service.register_task(
             MonitoredTask(
                 group_ref=group_ref,
@@ -1424,6 +1517,8 @@ class MainWindow(QMainWindow):
                 comment_id=result.comment_id,
                 reply_id=result.reply_id if require_reply else None,
                 interval_seconds=interval_sec,
+                track_new_posts=track_new_posts,
+                photo_path=self._selected_comment_photo_path(),
             )
         )
 

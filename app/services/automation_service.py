@@ -40,6 +40,7 @@ class ScenarioContext:
     comment_id: int | None = None
     reply_id: int | None = None
     next_step: str = "comment"
+    photo_path: str | None = None
 
 
 class AutomationService:
@@ -61,6 +62,7 @@ class AutomationService:
         prefer_pinned: bool = True,
         delay_seconds: float = 3,
         reply_required: bool = True,
+        photo_path: str | None = None,
     ) -> ScenarioRunResult:
         normalized_delay = max(0.0, float(delay_seconds))
 
@@ -93,6 +95,9 @@ class AutomationService:
         else:
             initial_logs = [owner_result.message, f"Используется указанный post_id={resolved_post_id}"]
 
+        if photo_path:
+            initial_logs.append(f"К комментарию будет прикреплено фото: {photo_path}")
+
         context = ScenarioContext(
             commentator_token=commentator_token,
             liker_token=liker_token,
@@ -104,6 +109,7 @@ class AutomationService:
             reply_required=reply_required,
             delay_seconds=normalized_delay,
             owner_id=owner_id,
+            photo_path=photo_path,
         )
         return self._execute_from_context(context, initial_logs=initial_logs)
 
@@ -140,6 +146,7 @@ class AutomationService:
                 owner_id=context.owner_id,
                 post_id=context.post_id,
                 text=context.comment_text,
+                photo_path=context.photo_path,
             )
             logs.append(comment_result.message)
             if not comment_result.success:
